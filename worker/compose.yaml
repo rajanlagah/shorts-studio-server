@@ -1,0 +1,22 @@
+# Use only if deploying worker separately; recommended combined compose is in api/.
+name: shorts-worker
+services:
+  worker:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: 2500m
+    cpus: 1.5
+    volumes:
+      - media:/data
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  media:
+    external: true
+    name: shorts-v1_media

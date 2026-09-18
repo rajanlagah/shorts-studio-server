@@ -1,0 +1,18 @@
+{
+  "name": "shorts-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env src/index.js",
+    "test": "node --test",
+    "test:media": "node scripts/media-smoke.js"
+  },
+  "dependencies": {
+    "pg": "^8.16.3",
+    "zod": "^3.25.76"
+  }
+}

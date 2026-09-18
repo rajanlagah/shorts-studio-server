@@ -1,0 +1,46 @@
+name: shorts-v1
+services:
+  api:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    init: true
+    volumes:
+      - media:/data
+    ports:
+      - "127.0.0.1:3001:3001"
+    mem_limit: 512m
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+  worker:
+    build: ../worker
+    env_file: ../worker/.env
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    volumes:
+      - media:/data
+    mem_limit: 2500m
+    cpus: 1.5
+    logging: *logging
+  caddy:
+    image: caddy:2-alpine
+    profiles: [https]
+    restart: unless-stopped
+    environment:
+      API_HOST: ${API_HOST}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    logging: *logging
+volumes:
+  media:
+  caddy_data:
+  caddy_config:
