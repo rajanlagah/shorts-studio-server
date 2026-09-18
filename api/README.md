@@ -12,7 +12,7 @@ This starter implements temporary uploads, a PostgreSQL job queue, ordered trimm
 
 ## 1. Supabase database
 
-Use a new project. In SQL Editor, open `api/schema.sql`, replace the backend-role password, and run it once. This creates a private `shorts` schema, tables, RLS policies, and a dedicated backend role. Never put the database password in your frontend.
+Use a new project. Follow `api/MIGRATIONS.md`: create the backend role once with `api/bootstrap.sql`, then run `npm run db:migrate` from `api/` with a separate admin connection. This creates the private `shorts` schema, tables, and RLS policies. Existing installations created with `api/schema.sql` can adopt migrations without recreating the backend role. Never put the database password in your frontend.
 
 Copy the direct or **session pooler** connection details from Supabase Connect. Use `shorts_backend` as the direct username, or `shorts_backend.PROJECT_REF` for the session pooler. Port is normally 5432. Do NOT use the transaction pooler: the worker uses a session advisory lock. Both services must use the SAME database and role. For an IPv4 Droplet use the session pooler if the direct endpoint requires IPv6.
 
