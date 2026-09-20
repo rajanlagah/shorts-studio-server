@@ -94,3 +94,52 @@ This buffers the output in browser memory. No range/resumable download support i
 ## Health
 
 `GET /health` checks process liveness. `GET /ready` also checks DB connectivity. Neither endpoint checks worker health; inspect worker logs and queued job age.
+
+## Accounts and projects — v0.1
+
+A separate auth boundary from the anonymous editor sessions above: real Google-authenticated
+users, each with a plan and a `builds_remaining` counter. Every endpoint below requires
+`Authorization: Bearer USER_TOKEN`; a missing/expired/unknown token returns 401 (not 404/410 —
+that convention is specific to the anonymous session endpoints).
+
+### Sign in with Google
+
+`POST /v1/auth/google`, JSON `{"idToken":"GOOGLE_ID_TOKEN"}` (from Google Identity Services on
+the frontend). Verifies the token against Google's `tokeninfo` endpoint, upserts the user, and
+returns HTTP 201:
+
+```json
+{"token":"USER_TOKEN","user":{"id":"...","email":"...","name":"...","avatarUrl":"...","plan":"free","buildsRemaining":3,"buildsResetAt":"ISO_TIMESTAMP"}}
+```
+
+`buildsRemaining` is `null` for unlimited plans (starter/pro). Requires `GOOGLE_CLIENT_ID` set on
+the server; 503 if unset.
+
+### Current user
+
+`GET /v1/me` → the same `user` object as above. `POST /v1/logout` → 204, invalidates the token.
+
+### Projects
+
+`GET /v1/projects` → array of the caller's projects, most recently updated first.
+`POST /v1/projects`, optional JSON `{"title":"..."}` → HTTP 201, a new `draft` project.
+`PATCH /v1/projects/:id`, JSON subset of `{"title","clipCount","duration","thumbnail"}` → the
+updated project. `DELETE /v1/projects/:id` → 204.
+
+A project looks like:
+
+```json
+{"id":"...","title":"...","status":"draft","clipCount":0,"duration":0,"thumbnail":null,"sessionId":null,"jobId":null,"createdAt":"...","updatedAt":"..."}
+```
+
+`status` is one of `draft`/`processing`/`completed`/`failed`.
+
+### Sync a project against its editor job
+
+`POST /v1/projects/:id/sync`, JSON `{"sessionId":"...","jobId":"..."}` (the anonymous editor
+session/job from the flow above) → `{"project":{...},"user":{...}}`. Re-reads the real job status
+server-side (never trusts the client's claim), updates the project's status, and — the first time
+an `export` job is observed `completed` for that project — decrements `builds_remaining` by one.
+Returns 402 if the Free plan's builds are already exhausted. Call this right after submitting an
+export and again once polling observes `completed`/`failed`, so the project and builds-remaining
+count stay accurate.

@@ -8,14 +8,16 @@ import {createWriteStream,createReadStream} from 'node:fs';
 import {pipeline} from 'node:stream/promises';
 import {join} from 'node:path';
 import {pool,transaction,dataDir,dir,assetPath,uuid,edit} from './common.js';
+import users from './users.js';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const fail=(statusCode,message)=>Object.assign(new Error(message),{statusCode});
 const app=Fastify({logger:{redact:['req.headers.authorization']},bodyLimit:1024*1024,requestTimeout:120000,trustProxy:process.env.TRUST_PROXY==='true' ? 1 : false});
 await mkdir(dataDir,{recursive:true});
-await app.register(cors,{origin:(process.env.CORS_ORIGINS||'http://localhost:3000').split(','),methods:['GET','POST'],allowedHeaders:['Content-Type','Authorization']});
+await app.register(cors,{origin:(process.env.CORS_ORIGINS||'http://localhost:3000').split(','),methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Content-Type','Authorization']});
 app.addHook('onSend',async(req,reply,payload)=>{reply.header('Cache-Control','no-store');return payload;});
 await app.register(rateLimit,{max:120,timeWindow:'1 minute'});
 await app.register(multipart,{limits:{files:1,fields:0,fileSize:500*1024*1024,parts:1}});
+await app.register(users);
 app.setErrorHandler((err,req,reply)=>{const status=err.name==='ZodError'?400:err.statusCode||500;if(status>=500)req.log.error({message:err.message},'Request failed');reply.code(status).send({error:status>=500?'Internal server error':err.message});});
 async function session(c,req){
  const id=uuid.parse(req.params.id);
