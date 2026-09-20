@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {googleBody,createBody,patchBody,syncBody} from '../src/users.js';
+import {googleBody,createBody,patchBody,syncBody,projectEditBody} from '../src/users.js';
 const assetId = '11111111-1111-4111-8111-111111111111';
 test('googleBody requires a non-trivial idToken', () => {
   assert.equal(googleBody.safeParse({}).success, false);
@@ -23,4 +23,23 @@ test('syncBody requires both ids as UUIDs', () => {
   assert.equal(syncBody.safeParse({sessionId: assetId}).success, false);
   assert.equal(syncBody.safeParse({sessionId: 'nope', jobId: assetId}).success, false);
   assert.equal(syncBody.safeParse({sessionId: assetId, jobId: assetId}).success, true);
+});
+test('projectEditBody allows an empty edit and rejects unknown fields', () => {
+  assert.equal(projectEditBody.safeParse({}).success, true);
+  assert.deepEqual(projectEditBody.parse({}), {clips: [], captions: []});
+  assert.equal(projectEditBody.safeParse({clips: [], captions: [], nope: 1}).success, false);
+});
+test('projectEditBody allows an empty caption (mid-typing) but rejects a bad time range', () => {
+  const clip = {assetId: assetId, start: 0, end: 2, fit: 'fit'};
+  assert.equal(projectEditBody.safeParse({clips: [clip], captions: [{start: 0, end: 1, text: ''}]}).success, true);
+  assert.equal(projectEditBody.safeParse({clips: [clip], captions: [{start: 1, end: 1, text: 'x'}]}).success, false);
+});
+test('projectEditBody caps clips at 5 and captions at 500', () => {
+  const clip = {assetId: assetId, start: 0, end: 1, fit: 'fit'};
+  assert.equal(projectEditBody.safeParse({clips: Array(6).fill(clip), captions: []}).success, false);
+  assert.equal(projectEditBody.safeParse({clips: [clip], captions: Array(501).fill({start: 0, end: 1, text: 'x'})}).success, false);
+});
+test('patchBody accepts an optional edit alongside the existing fields', () => {
+  assert.equal(patchBody.safeParse({title: 'ok', edit: {clips: [], captions: []}}).success, true);
+  assert.equal(patchBody.safeParse({edit: {clips: [{assetId: 'not-a-uuid', start: 0, end: 1}]}}).success, false);
 });

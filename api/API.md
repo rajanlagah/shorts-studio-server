@@ -121,10 +121,14 @@ the server; 503 if unset.
 
 ### Projects
 
-`GET /v1/projects` → array of the caller's projects, most recently updated first.
+`GET /v1/projects` → array of the caller's projects, most recently updated first (summary fields
+only — no `edit`, kept light for the list view).
+`GET /v1/projects/:id` → a single project, including its full `edit` (see below). 404 if not found
+or not owned by the caller.
 `POST /v1/projects`, optional JSON `{"title":"..."}` → HTTP 201, a new `draft` project.
-`PATCH /v1/projects/:id`, JSON subset of `{"title","clipCount","duration","thumbnail"}` → the
-updated project. `DELETE /v1/projects/:id` → 204.
+`PATCH /v1/projects/:id`, JSON subset of `{"title","clipCount","duration","thumbnail","edit"}` → the
+updated project (summary fields only in the response — `edit` is not echoed back). `DELETE
+/v1/projects/:id` → 204.
 
 A project looks like:
 
@@ -133,6 +137,26 @@ A project looks like:
 ```
 
 `status` is one of `draft`/`processing`/`completed`/`failed`.
+
+### A project's saved edit (resume)
+
+`GET /v1/projects/:id` additionally returns `"edit":{"clips":[...],"captions":[...]}` (defaults to
+`{"clips":[],"captions":[]}` if never saved). `PATCH /v1/projects/:id` accepts the same shape as an
+optional `edit` field:
+
+```json
+{"edit":{"clips":[{"assetId":"...","start":0,"end":2,"fit":"fit"}],"captions":[{"start":0,"end":2,"text":"..."}]}}
+```
+
+0-5 clips, 0-500 captions; caption `text` and the clips array may be empty (a mid-typing caption, or
+a freshly reset project, must be saveable). When `edit` is present in a `PATCH`, `clipCount` and
+`duration` are derived from it server-side — any `clipCount`/`duration` sent in the same request
+body are ignored.
+
+**Video bytes are never sent to or stored by this endpoint.** `assetId` here is an opaque
+client-generated id the frontend uses to match a clip back to its locally-cached video (IndexedDB);
+it is unrelated to the session-scoped asset ids from `POST /v1/sessions/:id/assets` used during
+actual export.
 
 ### Sync a project against its editor job
 

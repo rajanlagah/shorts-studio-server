@@ -5,16 +5,21 @@ const hash=s=>createHash('sha256').update(s).digest('hex');
 const fail=(statusCode,message)=>Object.assign(new Error(message),{statusCode});
 const googleBody=z.object({idToken:z.string().min(10)}).strict();
 const createBody=z.object({title:z.string().trim().min(1).max(70)}).strict().partial();
+const editClip=z.object({assetId:uuid,start:z.number().min(0).max(3600),end:z.number().positive().max(3600),fit:z.enum(['fit','crop']).default('fit')}).strict().refine(c=>c.end>c.start);
+const editCaption=z.object({start:z.number().min(0).max(180),end:z.number().positive().max(180),text:z.string().max(300)}).strict().refine(c=>c.end>c.start);
+const projectEditBody=z.object({clips:z.array(editClip).max(5).default([]),captions:z.array(editCaption).max(500).default([])}).strict();
 const patchBody=z.object({
  title:z.string().trim().min(1).max(70).optional(),
  clipCount:z.number().int().min(0).max(5).optional(),
  duration:z.number().min(0).max(3600).optional(),
  thumbnail:z.string().max(200000).optional(),
+ edit:projectEditBody.optional(),
 }).strict();
 const syncBody=z.object({sessionId:uuid,jobId:uuid}).strict();
-export {googleBody,createBody,patchBody,syncBody};
+export {googleBody,createBody,patchBody,syncBody,projectEditBody};
 const serializeUser=u=>({id:u.id,email:u.email,name:u.name,avatarUrl:u.avatar_url,plan:u.plan,buildsRemaining:u.builds_remaining,buildsResetAt:u.builds_reset_at});
 const serializeProject=p=>({id:p.id,title:p.title,status:p.status,clipCount:p.clip_count,duration:Number(p.duration),thumbnail:p.thumbnail,sessionId:p.session_id,jobId:p.job_id,createdAt:p.created_at,updatedAt:p.updated_at});
+const serializeProjectDetail=p=>({...serializeProject(p),edit:p.edit||{clips:[],captions:[]}});
 // Auth boundary for real accounts; distinct from the anonymous editor session's 404/410 convention.
 async function userAuth(c,req){
  const token=req.headers.authorization?.replace(/^Bearer /,'')||'';
@@ -71,16 +76,30 @@ export default async function users(app){
  const {rows:[project]}=await c.query('select * from shorts.projects where id=$1',[id]);
  return reply.code(201).send(serializeProject(project));
  }));
+ app.get('/v1/projects/:id',async req=>transaction(async c=>{
+ const user=await userAuth(c,req);
+ const id=uuid.parse(req.params.id);
+ const {rows:[project]}=await c.query('select * from shorts.projects where id=$1 and user_id=$2',[id,user.id]);
+ if(!project)throw fail(404,'Project not found');
+ return serializeProjectDetail(project);
+ }));
  app.patch('/v1/projects/:id',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
  const id=uuid.parse(req.params.id);
  const patch=patchBody.parse(req.body||{});
  const {rows:[existing]}=await c.query('select id from shorts.projects where id=$1 and user_id=$2',[id,user.id]);
  if(!existing)throw fail(404,'Project not found');
+ // When a full edit is saved, clipCount/duration are derived from it —
+ // the frontend must not (and no longer needs to) send them separately
+ // in the same call.
+ if(patch.edit){
+ patch.clipCount=patch.edit.clips.length;
+ patch.duration=patch.edit.clips.reduce((n,cl)=>n+(cl.end-cl.start),0);
+ }
  const sets=['updated_at=now()'],values=[id];
- for(const [col,key] of [['title','title'],['clip_count','clipCount'],['duration','duration'],['thumbnail','thumbnail']]){
+ for(const [col,key,serialize] of [['title','title'],['clip_count','clipCount'],['duration','duration'],['thumbnail','thumbnail'],['edit','edit',JSON.stringify]]){
  if(patch[key]===undefined)continue;
- values.push(patch[key]);
+ values.push(serialize?serialize(patch[key]):patch[key]);
  sets.push(`${col}=$${values.length}`);
  }
  await c.query(`update shorts.projects set ${sets.join(',')} where id=$1`,values);
