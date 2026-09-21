@@ -14,3 +14,11 @@ test('allows reused assets and supplies default fit/captions',()=>{
  const p=edit.parse({clips:[{assetId,start:0,end:1},{assetId,start:2,end:3}]});
  assert.equal(p.clips[0].fit,'fit');assert.deepEqual(p.captions,[]);
 });
+test('edit accepts optional wordsPerCaption/captionStyle and defaults captionStyle to classic',()=>{
+ const base={clips:[{assetId,start:0,end:2}]};
+ const parsed=edit.parse({...base,wordsPerCaption:3,captionStyle:'highlight'});
+ assert.equal(parsed.wordsPerCaption,3);assert.equal(parsed.captionStyle,'highlight');
+ assert.equal(edit.parse(base).captionStyle,'classic');
+ assert.equal(edit.safeParse({...base,wordsPerCaption:5}).success,false);
+ assert.equal(edit.safeParse({...base,captionStyle:'neon'}).success,false);
+});

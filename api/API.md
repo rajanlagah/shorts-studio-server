@@ -43,14 +43,18 @@ HTTP 201: `{"id":"ASSET_UUID","bytes":12345}`. Raw filenames are not used on dis
     "captions": [
       {"start":0.2,"end":2.5,"text":"My first caption"},
       {"start":3.0,"end":5.8,"text":"My second caption"}
-    ]
+    ],
+    "wordsPerCaption": 2,
+    "captionStyle": "highlight"
   }
 }
 ```
 
-Clips play in array order. `start` and `end` are SOURCE times. Caption times refer to the FINAL timeline. `fit` defaults to `fit` (letterbox); `crop` is centered fill. No speed changes. Asset IDs may be reused. Captions default to an empty array. One fixed caption style.
+Clips play in array order. `start` and `end` are SOURCE times. Caption times refer to the FINAL timeline. `fit` defaults to `fit` (letterbox); `crop` is centered fill. Two caption styles (`classic`/`highlight`, chosen per export via `captionStyle`); auto-transcription can group words into 1-4-word captions via `wordsPerCaption`. No video/audio speed changes. Asset IDs may be reused. Captions default to an empty array.
 
-Set `kind` to `transcribe` and omit captions to generate sentence/segment captions. It calls OpenAI whisper-1 via the worker, sends extracted audio, and incurs provider usage charges. It does not export an MP4. No API key: job fails; manually supplied captions still work.
+`wordsPerCaption` (integer, 1-4, optional) is only meaningful for `kind: "transcribe"`; it groups real word-level ASR timing into that many words per generated caption instead of whole-sentence segments, defaulting to 2 words per caption if omitted. `captionStyle` (`"classic"` | `"highlight"`, optional, defaults to `"classic"`) is only meaningful for `kind: "export"`; `"highlight"` is a larger, accent-colored style intended for short (1-4 word) card-style captions.
+
+Set `kind` to `transcribe` and omit captions to generate word-grouped captions (see `wordsPerCaption` above). It calls OpenAI whisper-1 via the worker, sends extracted audio, and incurs provider usage charges. It does not export an MP4. No API key: job fails; manually supplied captions still work.
 
 HTTP 202: `{"id":"JOB_UUID","status":"queued"}`.
 
