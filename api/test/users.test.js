@@ -34,9 +34,10 @@ test('projectEditBody allows an empty caption (mid-typing) but rejects a bad tim
   assert.equal(projectEditBody.safeParse({clips: [clip], captions: [{start: 0, end: 1, text: ''}]}).success, true);
   assert.equal(projectEditBody.safeParse({clips: [clip], captions: [{start: 1, end: 1, text: 'x'}]}).success, false);
 });
-test('projectEditBody caps clips at 5 and captions at 500', () => {
+test('projectEditBody has a generous structural cap; real per-plan limits are enforced in the route handler, not here', () => {
   const clip = {assetId: assetId, start: 0, end: 1, fit: 'fit'};
-  assert.equal(projectEditBody.safeParse({clips: Array(6).fill(clip), captions: []}).success, false);
+  assert.equal(projectEditBody.safeParse({clips: Array(55).fill(clip), captions: []}).success, true);
+  assert.equal(projectEditBody.safeParse({clips: Array(56).fill(clip), captions: []}).success, false);
   assert.equal(projectEditBody.safeParse({clips: [clip], captions: Array(501).fill({start: 0, end: 1, text: 'x'})}).success, false);
 });
 test('patchBody accepts an optional edit alongside the existing fields', () => {

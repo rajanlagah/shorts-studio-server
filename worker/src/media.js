@@ -15,9 +15,12 @@ export async function probe(path,signal){
  return {duration,audio:result.streams.some(x=>x.codec_type==='audio')};
 }
 const stamp=t=>{const n=Math.round(t*100);return `${Math.floor(n/360000)}:${String(Math.floor(n/6000)%60).padStart(2,'0')}:${String(Math.floor(n/100)%60).padStart(2,'0')}.${String(n%100).padStart(2,'0')}`;};
-export function ass(captions){
+// Matches --caption-highlight in the frontend's styles.css (plan 007) so
+// the burned-in export and the live preview use the same color.
+export function ass(captions,captionStyle='classic'){
  // Neutralize ASS override sequences while keeping real line breaks.
  const text=s=>s.replaceAll('\\','／').replaceAll('{','(').replaceAll('}',')').replaceAll('\r','').replaceAll('\n','\\N');
+ const styleName=captionStyle==='highlight'?'Highlight':'Default';
  return `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
@@ -26,9 +29,10 @@ WrapStyle: 0
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
 Style: Default,Noto Sans,58,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,80,80,240,1
+Style: Highlight,Noto Sans,66,&H000AD6FF,&H000AD6FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,80,80,240,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-`+captions.map(c=>`Dialogue: 0,${stamp(c.start)},${stamp(c.end)},Default,,0,0,0,,${text(c.text)}`).join('\n');
+`+captions.map(c=>`Dialogue: 0,${stamp(c.start)},${stamp(c.end)},${styleName},,0,0,0,,${text(c.text)}`).join('\n');
 }
 export async function renderTimeline(sessionId,input,work,{signal,onProgress=async()=>{}}={}){
  const payload=edit.parse(input);await mkdir(work,{recursive:true});
@@ -48,7 +52,7 @@ export async function renderTimeline(sessionId,input,work,{signal,onProgress=asy
 export async function exportVideo(sessionId,payload,work,options){
  await renderTimeline(sessionId,payload,work,options);
  if(payload.captions.length){
- await writeFile(join(work,'captions.ass'),ass(payload.captions));
+ await writeFile(join(work,'captions.ass'),ass(payload.captions,payload.captionStyle));
  await run('ffmpeg',['-nostdin','-y','-v','error','-filter_threads','1','-i','joined.mp4','-vf','ass=captions.ass','-c:v','libx264','-preset','veryfast','-crf','23','-threads','1','-c:a','copy','-movflags','+faststart','output.mp4'],{cwd:work,signal:options.signal});
  }else{const {rename}=await import('node:fs/promises');await rename(join(work,'joined.mp4'),join(work,'output.mp4'));}
  return {downloadReady:true};
@@ -58,9 +62,19 @@ export async function transcribe(sessionId,payload,work,options){
  await renderTimeline(sessionId,payload,work,options);
  await run('ffmpeg',['-nostdin','-y','-v','error','-i','joined.mp4','-vn','-ac','1','-ar','16000','audio.wav'],{cwd:work,signal:options.signal});
  const form=new FormData();form.append('file',new Blob([await readFile(join(work,'audio.wav'))],{type:'audio/wav'}),'audio.wav');form.append('model','whisper-1');form.append('response_format','verbose_json');form.append('timestamp_granularities[]','segment');
+ form.append('timestamp_granularities[]','word');
  const response=await fetch('https://api.openai.com/v1/audio/transcriptions',{method:'POST',headers:{Authorization:`Bearer ${process.env.OPENAI_API_KEY}`},body:form,signal:options.signal});
  if(!response.ok)throw new Error(`Transcription provider returned HTTP ${response.status}`);
  const data=await response.json();const duration=payload.clips.reduce((n,c)=>n+c.end-c.start,0);
- const captions=(data.segments||[]).map(s=>({start:Math.max(0,s.start),end:Math.min(duration,s.end),text:s.text.trim().slice(0,300)})).filter(c=>c.end>c.start && c.text);
+ const perCard=payload.wordsPerCaption||2;
+ const words=(data.words||[]).map(w=>({text:w.word.trim(),start:Math.max(0,w.start),end:Math.min(duration,w.end)})).filter(w=>w.end>w.start && w.text);
+ const cards=[];
+ for(let i=0;i<words.length;i+=perCard){
+ const chunk=words.slice(i,i+perCard);
+ cards.push({start:chunk[0].start,end:chunk[chunk.length-1].end,text:chunk.map(w=>w.text).join(' ').slice(0,300)});
+ }
+ // Defensive fallback: if the provider ever omits word timestamps, keep
+ // today's segment-level behavior rather than returning nothing.
+ const captions=(cards.length?cards:(data.segments||[]).map(s=>({start:Math.max(0,s.start),end:Math.min(duration,s.end),text:s.text.trim().slice(0,300)}))).filter(c=>c.end>c.start && c.text);
  return {captions:edit.parse({...payload,captions}).captions};
 }
