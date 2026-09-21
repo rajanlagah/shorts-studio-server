@@ -8,7 +8,7 @@ import {createWriteStream,createReadStream} from 'node:fs';
 import {pipeline} from 'node:stream/promises';
 import {join} from 'node:path';
 import {pool,transaction,dataDir,dir,assetPath,uuid,edit} from './common.js';
-import users from './users.js';
+import users, {getCustomerFeatures} from './users.js';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const fail=(statusCode,message)=>Object.assign(new Error(message),{statusCode});
 const app=Fastify({logger:{redact:['req.headers.authorization']},bodyLimit:1024*1024,requestTimeout:120000,trustProxy:process.env.TRUST_PROXY==='true' ? 1 : false});
@@ -18,7 +18,7 @@ app.addHook('onSend',async(req,reply,payload)=>{reply.header('Cache-Control','no
 await app.register(rateLimit,{max:120,timeWindow:'1 minute'});
 await app.register(multipart,{limits:{files:1,fields:0,fileSize:500*1024*1024,parts:1}});
 await app.register(users);
-app.setErrorHandler((err,req,reply)=>{const status=err.name==='ZodError'?400:err.statusCode||500;if(status>=500)req.log.error({message:err.message},'Request failed');reply.code(status).send({error:status>=500?'Internal server error':err.message});});
+app.setErrorHandler((err,req,reply)=>{const status=err.name==='ZodError'?400:err.statusCode||500;if(status>=500)req.log.error({message:err.message},'Request failed');const body={error:status>=500?'Internal server error':err.message};if(err.feature_key)body.featureKey=err.feature_key;reply.code(status).send(body);});
 async function session(c,req){
  const id=uuid.parse(req.params.id);
  const {rows:[s]}=await c.query('select * from shorts.sessions where id=$1 for update',[id]);
@@ -30,14 +30,18 @@ async function session(c,req){
 app.get('/health',async()=>({ok:true}));
 app.get('/ready',async()=>{await pool.query('select 1');return {ok:true};});
 app.post('/v1/sessions',{config:{rateLimit:{max:10,timeWindow:'1 hour'}}},async(req,reply)=>{
- const id=randomUUID(),token=randomBytes(32).toString('hex');
+ const token=req.headers.authorization?.replace(/^Bearer /,'')||'';
+ if(!token)throw fail(401,'Missing token');
+ const {rows:[tokenRow]}=await pool.query('select user_id from shorts.user_tokens where token_hash=$1 and expires_at>now()',[hash(token)]);
+ if(!tokenRow)throw fail(401,'Invalid or expired token');
+ const id=randomUUID(),sessionToken=randomBytes(32).toString('hex');
  await transaction(async c=>{
  await c.query('select pg_advisory_xact_lock(784321)');
  const {rows:[{count}]}=await c.query('select count(*) from shorts.sessions');
  if(Number(count)>=20)throw fail(503,'Server busy; try later');
- await c.query('insert into shorts.sessions(id,token_hash) values($1,$2)',[id,hash(token)]);
+ await c.query('insert into shorts.sessions(id,token_hash,user_id) values($1,$2,$3)',[id,hash(sessionToken),tokenRow.user_id]);
  });
- return reply.code(201).send({id,token,expiresInSeconds:7200});
+ return reply.code(201).send({id,token:sessionToken,expiresInSeconds:7200});
 });
 app.post('/v1/sessions/:id/assets',async(req,reply)=>transaction(async c=>{
  const s=await session(c,req);
@@ -58,6 +62,10 @@ app.post('/v1/sessions/:id/assets',async(req,reply)=>transaction(async c=>{
 app.post('/v1/sessions/:id/jobs',async(req,reply)=>transaction(async c=>{
  const s=await session(c,req);
  const kind=req.body?.kind;if(!['export','transcribe'].includes(kind))throw fail(400,'kind must be export or transcribe');
+ if(kind==='transcribe'){
+ const features=await getCustomerFeatures(c,s.user_id);
+ if(!features.auto_caption.enabled)throw Object.assign(fail(403,'Auto captions are not available on your plan.'),{feature_key:'auto_caption'});
+ }
  const payload=edit.parse(req.body?.edit);
  if(payload.clips.some(x=>!s.assets.some(a=>a.id===x.assetId)))throw fail(400,'Unknown asset');
  // Serialize queue admission, cap global outstanding work and per-session tasks.
