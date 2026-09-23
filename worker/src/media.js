@@ -1,7 +1,10 @@
 import {spawn} from 'node:child_process';
 import {writeFile,readFile,mkdir} from 'node:fs/promises';
 import {join} from 'node:path';
+import {fileURLToPath} from 'node:url';
 import {assetPath,edit} from './common.js';
+import {FONTS,resolveStyle} from './style.js';
+const fontsDir=fileURLToPath(new URL('../fonts/ttf',import.meta.url));
 export function run(bin,args,{cwd,signal}={}){return new Promise((resolve,reject)=>{
  const p=spawn(bin,args,{cwd,signal,stdio:['ignore','pipe','pipe']});let out='',err='';
  const timer=setTimeout(()=>p.kill('SIGKILL'),15*60*1000);
@@ -15,24 +18,78 @@ export async function probe(path,signal){
  return {duration,audio:result.streams.some(x=>x.codec_type==='audio')};
 }
 const stamp=t=>{const n=Math.round(t*100);return `${Math.floor(n/360000)}:${String(Math.floor(n/6000)%60).padStart(2,'0')}:${String(Math.floor(n/100)%60).padStart(2,'0')}.${String(n%100).padStart(2,'0')}`;};
-// Matches --caption-highlight in the frontend's styles.css (plan 007) so
-// the burned-in export and the live preview use the same color.
-export function ass(captions,captionStyle='classic'){
- // Neutralize ASS override sequences while keeping real line breaks.
- const text=s=>s.replaceAll('\\','／').replaceAll('{','(').replaceAll('}',')').replaceAll('\r','').replaceAll('\n','\\N');
- const styleName=captionStyle==='highlight'?'Highlight':'Default';
+// ASS colors are &HBBGGRR&; alpha is &HAA& with 00 = opaque.
+export const bgr=hex=>`&H${hex.slice(5,7)}${hex.slice(3,5)}${hex.slice(1,3)}&`.toUpperCase();
+export const alpha=opacity=>`&H${Math.round((1-opacity)*255).toString(16).padStart(2,'0').toUpperCase()}&`;
+// Break text into lines of at most N characters (on spaces; explicit newlines
+// kept). Every event of a caption uses these lines with \q2, so word
+// highlight events never re-wrap. The frontend preview uses the same formula.
+export function preWrap(text,size){
+ const n=Math.floor(900/(size*0.55)),lines=[];
+ for(const para of text.replaceAll('\r','').split('\n')){
+ let line='';
+ for(const w of para.split(/\s+/).filter(Boolean)){if(line&&line.length+1+w.length>n){lines.push(line);line=w;}else line=line?`${line} ${w}`:w;}
+ if(line)lines.push(line);
+ }
+ return lines;
+}
+// Real timings when they match the word count, else an equal split.
+function wordTimes(c,count){
+ if(c.words?.length===count)return c.words;
+ const d=(c.end-c.start)/count;
+ return Array.from({length:count},(_,i)=>({start:c.start+i*d,end:c.start+(i+1)*d}));
+}
+// Neutralize ASS override sequences in user text; every tag below is generated.
+const clean=s=>s.replaceAll('\\','／').replaceAll('{','(').replaceAll('}',')');
+const ANCHOR={bottom:[2,1920-240],middle:[5,960],top:[8,240]};
+function captionEvents(c,s){
+ const f=FONTS[s.font],[an,y]=ANCHOR[s.position.anchor],h=s.highlight;
+ const head=`\\an${an}\\pos(540,${y-s.position.offset})\\q2\\b${s.weight===700?1:0}\\i${s.italic?1:0}\\fn${f.family}\\fs${s.size}\\fsp${s.letterSpacing}`;
+ const lines=preWrap(s.uppercase?c.text.toUpperCase():c.text,s.size).map(l=>l.split(' ').map(clean));
+ // Render the caption's words; span(i) returns the override tags for word i.
+ const body=span=>{let i=0;return lines.map(ws=>ws.map((w,j)=>`${span?`{${span(i++)}}`:''}${j?' ':''}${w}`).join('')).join('\\N');};
+ const out=[];
+ if(!lines.length)return out;
+ const line=(layer,style,start,end,text)=>{if(stamp(start)!==stamp(end))out.push(`Dialogue: ${layer},${stamp(start)},${stamp(end)},${style},,0,0,0,,${text}`);};
+ // Box layers use BorderStyle 3, whose "outline" is an opaque box; the
+ // glyphs themselves are invisible, the text layer draws them on top.
+ // libass draws no box at \bord0, so padding 0 means a hairline.
+ const boxHead=pad=>`{${head}\\1a&HFF&\\4a&HFF&\\shad0\\bord${Math.max(pad,0.1)}}`;
+ if(s.box.enabled)line(0,'Box',c.start,c.end,`${boxHead(s.box.padding)}{\\3c${bgr(s.box.color)}\\3a${alpha(s.box.opacity)}}${body()}`);
+ const textHead=`{${head}\\3c${bgr(s.outline.color)}\\bord${s.outline.width}\\4c${bgr(s.shadow.color)}\\shad${s.shadow.depth}}`;
+ const look=(color,opacity,scale)=>`\\1c${bgr(color)}\\1a${alpha(opacity)}\\3a${alpha(opacity)}\\4a${alpha(opacity*s.shadow.opacity)}\\fscx${scale}\\fscy${scale}`;
+ if(!h.enabled){line(1,'Default',c.start,c.end,`${textHead}{${look(s.color,1,100)}}${body()}`);return out;}
+ const count=lines.flat().length,times=wordTimes(c,count),clamp=t=>Math.min(c.end,Math.max(c.start,t));
+ const intervals=[];
+ if(clamp(times[0].start)>c.start)intervals.push([c.start,clamp(times[0].start),-1]);
+ for(let i=0;i<count;i++)intervals.push([clamp(times[i].start),i+1<count?clamp(times[i+1].start):c.end,i]);
+ const wordPad=Math.round(s.size*WORD_PAD);
+ for(const [start,end,active] of intervals){
+ if(end<=start)continue;
+ if(h.background.enabled&&active>=0)line(0,'Box',start,end,boxHead(wordPad)+body(i=>i===active?`\\3c${bgr(h.background.color)}\\3a${alpha(h.background.opacity)}\\fscx${h.scale}\\fscy${h.scale}`:'\\3a&HFF&\\fscx100\\fscy100'));
+ line(1,'Default',start,end,textHead+body(i=>i===active?look(h.color,1,h.scale):look(s.color,h.dimOpacity,100)));
+ }
+ return out;
+}
+// Padding around a highlighted word's background, as a fraction of font size
+// (frontend preview uses the same constant).
+export const WORD_PAD=0.12;
+// `captionStyle` is the parsed style object (legacy names already converted
+// by the schema); each caption's `style` is a partial override of it.
+export function ass(captions,captionStyle){
  return `[Script Info]
 ScriptType: v4.00+
 PlayResX: 1080
 PlayResY: 1920
 WrapStyle: 0
+ScaledBorderAndShadow: yes
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Noto Sans,58,&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,80,80,240,1
-Style: Highlight,Noto Sans,66,&H000AD6FF,&H000AD6FF,&H00000000,&H80000000,1,0,0,0,100,100,0,0,1,3,0,2,80,80,240,1
+Style: Default,Noto Sans,58,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,2,0,0,0,1
+Style: Box,Noto Sans,58,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,100,0,0,3,0,0,2,0,0,0,1
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-`+captions.map(c=>`Dialogue: 0,${stamp(c.start)},${stamp(c.end)},${styleName},,0,0,0,,${text(c.text)}`).join('\n');
+`+captions.flatMap(c=>captionEvents(c,resolveStyle(captionStyle,c.style))).join('\n');
 }
 export async function renderTimeline(sessionId,input,work,{signal,onProgress=async()=>{}}={}){
  const payload=edit.parse(input);await mkdir(work,{recursive:true});
@@ -49,11 +106,12 @@ export async function renderTimeline(sessionId,input,work,{signal,onProgress=asy
  await run('ffmpeg',['-nostdin','-y','-v','error','-f','concat','-safe','1','-i','clips.txt','-c','copy','-movflags','+faststart','joined.mp4'],{cwd:work,signal});
  return join(work,'joined.mp4');
 }
-export async function exportVideo(sessionId,payload,work,options){
+export async function exportVideo(sessionId,input,work,options){
+ const payload=edit.parse(input);
  await renderTimeline(sessionId,payload,work,options);
  if(payload.captions.length){
  await writeFile(join(work,'captions.ass'),ass(payload.captions,payload.captionStyle));
- await run('ffmpeg',['-nostdin','-y','-v','error','-filter_threads','1','-i','joined.mp4','-vf','ass=captions.ass','-c:v','libx264','-preset','veryfast','-crf','23','-threads','1','-c:a','copy','-movflags','+faststart','output.mp4'],{cwd:work,signal:options.signal});
+ await run('ffmpeg',['-nostdin','-y','-v','error','-filter_threads','1','-i','joined.mp4','-vf',`ass=captions.ass:fontsdir='${fontsDir}'`,'-c:v','libx264','-preset','veryfast','-crf','23','-threads','1','-c:a','copy','-movflags','+faststart','output.mp4'],{cwd:work,signal:options.signal});
  }else{const {rename}=await import('node:fs/promises');await rename(join(work,'joined.mp4'),join(work,'output.mp4'));}
  return {downloadReady:true};
 }

@@ -17,8 +17,8 @@ test('allows reused assets and supplies default fit/captions',()=>{
 test('edit accepts optional wordsPerCaption/captionStyle and defaults captionStyle to classic',()=>{
  const base={clips:[{assetId,start:0,end:2}]};
  const parsed=edit.parse({...base,wordsPerCaption:3,captionStyle:'highlight'});
- assert.equal(parsed.wordsPerCaption,3);assert.equal(parsed.captionStyle,'highlight');
- assert.equal(edit.parse(base).captionStyle,'classic');
+ assert.equal(parsed.wordsPerCaption,3);assert.equal(parsed.captionStyle.size,66);
+ assert.equal(edit.parse(base).captionStyle.size,58);
  assert.equal(edit.safeParse({...base,wordsPerCaption:5}).success,false);
  assert.equal(edit.safeParse({...base,captionStyle:'neon'}).success,false);
 });
