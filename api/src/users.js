@@ -17,7 +17,36 @@ const patchBody=z.object({
 }).strict();
 const syncBody=z.object({sessionId:uuid,jobId:uuid}).strict();
 const adminPlanBody=z.object({planId:uuid}).strict();
-export {googleBody,createBody,patchBody,syncBody,projectEditBody,adminPlanBody};
+const exchangeBody=z.object({code:z.string().min(20).max(100)}).strict();
+export {googleBody,createBody,patchBody,syncBody,projectEditBody,adminPlanBody,exchangeBody};
+// Shared by every Google sign-in endpoint. Generous because many mobile users
+// share one IP behind carrier NAT; the Google ID-token check bounds abuse.
+const loginRateLimit={max:60,timeWindow:'1 hour'};
+// The one place pricing wording lives, so www and the app never word the
+// same limit differently.
+function featureDisplay(f){
+ if(f.valueType==='boolean')return f.label;
+ const n=f.limit;
+ if(f.key==='exports')return n===null?'Unlimited exports':`${n} exports / month`;
+ if(f.key==='max_shorts')return n===null?'Unlimited shorts per project':`Up to ${n} shorts per project`;
+ if(f.key==='max_duration'){
+ if(n===null)return 'No export length limit';
+ return n>=120&&n%60===0?`Up to ${n/60} min per export`:`Up to ${n} sec per export`;
+ }
+ return n===null?`${f.label}: unlimited`:`${f.label}: ${n}`;
+}
+// featureRows must already be ordered by features.sort_order.
+function serializePlans(plans,featureRows){
+ return plans.map(p=>({
+ id:p.id,slug:p.slug,name:p.name,priceInr:Number(p.price_inr),billingInterval:p.billing_interval,isAvailable:p.is_available,
+ features:featureRows.filter(r=>r.plan_id===p.id).map(r=>{
+ const f={key:r.feature_key,label:r.label,valueType:r.value_type,enabled:r.enabled};
+ if(r.value_type!=='boolean')f.limit=r.config?.limit??null;
+ return {...f,display:featureDisplay(f)};
+ }),
+ }));
+}
+export {featureDisplay,serializePlans};
 const serializeUser=(u,plan,features)=>({id:u.id,email:u.email,name:u.name,avatarUrl:u.avatar_url,isAdmin:u.is_admin,plan,features});
 const serializeProject=p=>({id:p.id,title:p.title,status:p.status,clipCount:p.clip_count,duration:Number(p.duration),thumbnail:p.thumbnail,sessionId:p.session_id,jobId:p.job_id,createdAt:p.created_at,updatedAt:p.updated_at});
 const serializeProjectDetail=p=>({...serializeProject(p),edit:p.edit||{clips:[],captions:[]}});
@@ -70,16 +99,16 @@ async function userAuth(c,req){
  if(!row)throw fail(401,'Invalid or expired token');
  return row;
 }
-export default async function users(app){
- app.post('/v1/auth/google',{config:{rateLimit:{max:10,timeWindow:'1 hour'}}},async(req,reply)=>{
+async function verifyGoogleIdToken(idToken){
  if(!process.env.GOOGLE_CLIENT_ID)throw fail(503,'Google sign-in is not configured on the server');
- const {idToken}=googleBody.parse(req.body);
  const verify=await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`).catch(()=>null);
  if(!verify||!verify.ok)throw fail(401,'Invalid Google token');
  const payload=await verify.json();
  if(payload.aud!==process.env.GOOGLE_CLIENT_ID)throw fail(401,'Invalid Google token audience');
  if(payload.email_verified!=='true')throw fail(401,'Google email is not verified');
- return transaction(async c=>{
+ return payload;
+}
+async function upsertGoogleUser(c,payload){
  await c.query('select pg_advisory_xact_lock(784324)');
  const {rows:[freePlan]}=await c.query("select id from shorts.plans where slug='free'");
  const {rows:[existing]}=await c.query('select id from shorts.users where google_sub=$1',[payload.sub]);
@@ -87,12 +116,47 @@ export default async function users(app){
  if(existing)await c.query('update shorts.users set email=$2,name=$3,avatar_url=$4 where id=$1',[userId,payload.email,payload.name||null,payload.picture||null]);
  else await c.query('insert into shorts.users(id,google_sub,email,name,avatar_url,plan_id) values($1,$2,$3,$4,$5,$6)',[userId,payload.sub,payload.email,payload.name||null,payload.picture||null,freePlan.id]);
  if(!existing)await c.query('insert into shorts.customer_subscriptions(id,user_id,plan_id) values($1,$2,$3)',[randomUUID(),userId,freePlan.id]);
+ return userId;
+}
+// Mints a user token and returns the same {token,user} body as sign-in.
+async function issueSession(c,userId){
  const token=randomBytes(32).toString('hex');
  await c.query('insert into shorts.user_tokens(id,user_id,token_hash) values($1,$2,$3)',[randomUUID(),userId,hash(token)]);
  const {rows:[user]}=await c.query('select * from shorts.users where id=$1',[userId]);
  const {rows:[plan]}=await c.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where id=$1',[user.plan_id]);
  const features=await getCustomerFeatures(c,user.id);
- return reply.code(201).send({token,user:serializeUser(user,plan,features)});
+ return {token,user:serializeUser(user,plan,features)};
+}
+export default async function users(app){
+ app.post('/v1/auth/google',{config:{rateLimit:loginRateLimit}},async(req,reply)=>{
+ const {idToken}=googleBody.parse(req.body);
+ const payload=await verifyGoogleIdToken(idToken);
+ return transaction(async c=>{
+ const userId=await upsertGoogleUser(c,payload);
+ return reply.code(201).send(await issueSession(c,userId));
+ });
+ });
+ // www.shortmonk.com sign-in: returns a one-time code instead of a token; the
+ // app trades it at /v1/auth/exchange, so no long-lived token is put in a URL.
+ app.post('/v1/auth/google/handoff',{config:{rateLimit:loginRateLimit}},async(req,reply)=>{
+ const {idToken}=googleBody.parse(req.body);
+ const payload=await verifyGoogleIdToken(idToken);
+ return transaction(async c=>{
+ const userId=await upsertGoogleUser(c,payload);
+ const code=randomBytes(32).toString('base64url');
+ const {rows:[row]}=await c.query('insert into shorts.auth_handoff_codes(code_hash,user_id) values($1,$2) returning expires_at',[hash(code),userId]);
+ return reply.code(201).send({code,expiresAt:row.expires_at});
+ });
+ });
+ app.post('/v1/auth/exchange',{config:{rateLimit:{max:60,timeWindow:'1 hour'}}},async(req,reply)=>{
+ const {code}=exchangeBody.parse(req.body);
+ // Outside the transaction so the sweep isn't rolled back by a 401 below.
+ await pool.query('delete from shorts.auth_handoff_codes where expires_at<now()');
+ return transaction(async c=>{
+ // DELETE ... RETURNING is what makes a code single-use; keep it one statement.
+ const {rows:[row]}=await c.query('delete from shorts.auth_handoff_codes where code_hash=$1 and expires_at>now() returning user_id',[hash(code)]);
+ if(!row)throw fail(401,'This sign-in link has expired. Please sign in again.');
+ return reply.code(201).send(await issueSession(c,row.user_id));
  });
  });
  app.get('/v1/me',async req=>transaction(async c=>{
@@ -194,17 +258,11 @@ export default async function users(app){
  if(!user.is_admin)throw fail(403,'Admin access required');
  return user;
  }
- app.get('/v1/plans',async()=>{
- const {rows:plans}=await pool.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where is_active order by sort_order');
- const {rows:featureRows}=await pool.query('select pf.plan_id,pf.feature_key,pf.enabled,pf.config,f.value_type from shorts.plan_features pf join shorts.features f on f.key=pf.feature_key');
- return plans.map(p=>({
- ...p,
- features:Object.fromEntries(featureRows.filter(r=>r.plan_id===p.id).map(r=>{
- const entry={enabled:r.enabled};
- if(r.value_type!=='boolean')entry.limit=r.config?.limit??null;
- return [r.feature_key,entry];
- })),
- }));
+ app.get('/v1/plans',async(req,reply)=>{
+ const {rows:plans}=await pool.query('select id,slug,name,price_inr,billing_interval,is_available from shorts.plans where is_active order by sort_order');
+ const {rows:featureRows}=await pool.query('select pf.plan_id,pf.feature_key,pf.enabled,pf.config,f.label,f.value_type from shorts.plan_features pf join shorts.features f on f.key=pf.feature_key order by f.sort_order,f.key');
+ reply.header('Cache-Control','public, max-age=300');
+ return serializePlans(plans,featureRows);
  });
  app.patch('/v1/admin/customers/:id/plan',async req=>transaction(async c=>{
  await adminAuth(c,req);

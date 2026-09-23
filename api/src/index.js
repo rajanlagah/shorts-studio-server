@@ -19,7 +19,7 @@ await mkdir(dataDir,{recursive:true});
 // in users.js on Fastify's default {statusCode,error,message} error shape.
 app.setErrorHandler((err,req,reply)=>{const status=err.name==='ZodError'?400:err.statusCode||500;if(status>=500)req.log.error({message:err.message},'Request failed');const body={error:status>=500?'Internal server error':err.message};if(err.feature_key)body.featureKey=err.feature_key;reply.code(status).send(body);});
 await app.register(cors,{origin:(process.env.CORS_ORIGINS||'http://localhost:3000').split(','),methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Content-Type','Authorization']});
-app.addHook('onSend',async(req,reply,payload)=>{reply.header('Cache-Control','no-store');return payload;});
+app.addHook('onSend',async(req,reply,payload)=>{if(!reply.hasHeader('Cache-Control'))reply.header('Cache-Control','no-store');return payload;});
 await app.register(rateLimit,{max:120,timeWindow:'1 minute'});
 await app.register(multipart,{limits:{files:1,fields:0,fileSize:500*1024*1024,parts:1}});
 await app.register(users);
