@@ -44,3 +44,12 @@ test('patchBody accepts an optional edit alongside the existing fields', () => {
   assert.equal(patchBody.safeParse({title: 'ok', edit: {clips: [], captions: []}}).success, true);
   assert.equal(patchBody.safeParse({edit: {clips: [{assetId: 'not-a-uuid', start: 0, end: 1}]}}).success, false);
 });
+test('projectEditBody round-trips a captionStyle object and caption style/words', async () => {
+  const {LEGACY} = await import('../src/style.js');
+  const body = {clips: [], captions: [{start: 0, end: 2, text: 'a b', style: {color: '#FF0000', outline: {width: 0}}, words: [{start: 0, end: 1}, {start: 1, end: 2}]}], captionStyle: {...LEGACY.classic, font: 'poppins'}};
+  assert.deepEqual(projectEditBody.parse(body), body);
+  assert.deepEqual(projectEditBody.parse({captionStyle: 'highlight'}).captionStyle, LEGACY.highlight);
+  // Stored projects without a style stay style-less ("client default").
+  assert.equal('captionStyle' in projectEditBody.parse({}), false);
+  assert.equal(projectEditBody.safeParse({captionStyle: {...LEGACY.classic, size: 500}}).success, false);
+});

@@ -1,13 +1,14 @@
 import {randomUUID,randomBytes,createHash} from 'node:crypto';
 import {z} from 'zod';
-import {pool,transaction,uuid} from './common.js';
+import {pool,transaction,uuid,words,captionStyle} from './common.js';
+import {captionStyleOverride} from './style.js';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const fail=(statusCode,message)=>Object.assign(new Error(message),{statusCode});
 const googleBody=z.object({idToken:z.string().min(10)}).strict();
 const createBody=z.object({title:z.string().trim().min(1).max(70)}).strict().partial();
 const editClip=z.object({assetId:uuid,start:z.number().min(0).max(3600),end:z.number().positive().max(3600),fit:z.enum(['fit','crop']).default('fit')}).strict().refine(c=>c.end>c.start);
-const editCaption=z.object({start:z.number().min(0).max(180),end:z.number().positive().max(180),text:z.string().max(300)}).strict().refine(c=>c.end>c.start);
-const projectEditBody=z.object({clips:z.array(editClip).max(55).default([]),captions:z.array(editCaption).max(500).default([])}).strict();
+const editCaption=z.object({start:z.number().min(0).max(180),end:z.number().positive().max(180),text:z.string().max(300),style:captionStyleOverride.optional(),words:words.optional()}).strict().refine(c=>c.end>c.start);
+const projectEditBody=z.object({clips:z.array(editClip).max(55).default([]),captions:z.array(editCaption).max(500).default([]),captionStyle:captionStyle.optional()}).strict();
 const patchBody=z.object({
  title:z.string().trim().min(1).max(70).optional(),
  clipCount:z.number().int().min(0).max(5).optional(),

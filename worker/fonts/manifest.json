@@ -1,0 +1,68 @@
+{
+  "noto-sans": {
+    "family": "Noto Sans",
+    "assScale": 0.6583,
+    "files": {
+      "400": "NotoSans-Regular.ttf",
+      "700": "NotoSans-Bold.ttf",
+      "400i": "NotoSans-Italic.ttf",
+      "700i": "NotoSans-BoldItalic.ttf"
+    }
+  },
+  "montserrat": {
+    "family": "Montserrat",
+    "assScale": 0.6402,
+    "files": {
+      "400": "Montserrat-Regular.ttf",
+      "700": "Montserrat-Bold.ttf",
+      "400i": "Montserrat-Italic.ttf",
+      "700i": "Montserrat-BoldItalic.ttf"
+    }
+  },
+  "poppins": {
+    "family": "Poppins",
+    "assScale": 0.5675,
+    "files": {
+      "400": "Poppins-Regular.ttf",
+      "700": "Poppins-Bold.ttf",
+      "400i": "Poppins-Italic.ttf",
+      "700i": "Poppins-BoldItalic.ttf"
+    }
+  },
+  "oswald": {
+    "family": "Oswald",
+    "assScale": 0.5875,
+    "files": {
+      "400": "Oswald-Regular.ttf",
+      "700": "Oswald-Bold.ttf"
+    }
+  },
+  "anton": {
+    "family": "Anton",
+    "assScale": 0.5769,
+    "files": {
+      "400": "Anton-Regular.ttf"
+    }
+  },
+  "bebas-neue": {
+    "family": "Bebas Neue",
+    "assScale": 0.7692,
+    "files": {
+      "400": "BebasNeue-Regular.ttf"
+    }
+  },
+  "bangers": {
+    "family": "Bangers",
+    "assScale": 0.5692,
+    "files": {
+      "400": "Bangers-Regular.ttf"
+    }
+  },
+  "permanent-marker": {
+    "family": "Permanent Marker",
+    "assScale": 0.7009,
+    "files": {
+      "400": "PermanentMarker-Regular.ttf"
+    }
+  }
+}
