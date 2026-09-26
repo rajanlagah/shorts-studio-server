@@ -8,7 +8,9 @@ import {createWriteStream,createReadStream} from 'node:fs';
 import {pipeline} from 'node:stream/promises';
 import {join} from 'node:path';
 import {pool,transaction,dataDir,dir,assetPath,uuid,edit} from './common.js';
-import users, {getCustomerFeatures} from './users.js';
+import users, {getCustomerFeatures,errorHandler} from './users.js';
+import assets from './assets.js';
+import {createStorage} from './storage.js';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const fail=(statusCode,message)=>Object.assign(new Error(message),{statusCode});
 const app=Fastify({logger:{redact:['req.headers.authorization']},bodyLimit:1024*1024,requestTimeout:120000,trustProxy:process.env.TRUST_PROXY==='true' ? 1 : false});
@@ -17,12 +19,13 @@ await mkdir(dataDir,{recursive:true});
 // encapsulated context's inherited error handler at registration time, so
 // setting this after `app.register(users)` would silently leave every route
 // in users.js on Fastify's default {statusCode,error,message} error shape.
-app.setErrorHandler((err,req,reply)=>{const status=err.name==='ZodError'?400:err.statusCode||500;if(status>=500)req.log.error({message:err.message},'Request failed');const body={error:status>=500?'Internal server error':err.message};if(err.feature_key)body.featureKey=err.feature_key;reply.code(status).send(body);});
+app.setErrorHandler(errorHandler);
 await app.register(cors,{origin:(process.env.CORS_ORIGINS||'http://localhost:3000').split(','),methods:['GET','POST','PATCH','DELETE'],allowedHeaders:['Content-Type','Authorization']});
 app.addHook('onSend',async(req,reply,payload)=>{if(!reply.hasHeader('Cache-Control'))reply.header('Cache-Control','no-store');return payload;});
 await app.register(rateLimit,{max:120,timeWindow:'1 minute'});
 await app.register(multipart,{limits:{files:1,fields:0,fileSize:500*1024*1024,parts:1}});
 await app.register(users);
+await app.register(assets,{storage:createStorage()});
 async function session(c,req){
  const id=uuid.parse(req.params.id);
  const {rows:[s]}=await c.query('select * from shorts.sessions where id=$1 for update',[id]);

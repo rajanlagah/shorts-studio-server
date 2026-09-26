@@ -2,6 +2,7 @@ import {randomUUID,randomBytes,createHash} from 'node:crypto';
 import {z} from 'zod';
 import {pool,transaction,uuid,words,captionStyle} from './common.js';
 import {captionStyleOverride} from './style.js';
+import {usage,projectBytes,syncOverQuota,markDeleting,COUNTED} from './storage-usage.js';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const fail=(statusCode,message)=>Object.assign(new Error(message),{statusCode});
 const googleBody=z.object({idToken:z.string().min(10)}).strict();
@@ -19,7 +20,10 @@ const patchBody=z.object({
 const syncBody=z.object({sessionId:uuid,jobId:uuid}).strict();
 const adminPlanBody=z.object({planId:uuid}).strict();
 const exchangeBody=z.object({code:z.string().min(20).max(100)}).strict();
-export {googleBody,createBody,patchBody,syncBody,projectEditBody,adminPlanBody,exchangeBody};
+const settingsBody=z.object({communitySharing:z.boolean()}).strict();
+export {googleBody,createBody,patchBody,syncBody,projectEditBody,adminPlanBody,exchangeBody,settingsBody,fail};
+// Registered by index.js (and tests) before any plugin, so every route shares it.
+export function errorHandler(err,req,reply){const status=err.name==='ZodError'?400:err.statusCode||500;if(status>=500)req.log.error({message:err.message},'Request failed');const body={error:status>=500?'Internal server error':err.message};if(err.feature_key)body.featureKey=err.feature_key;reply.code(status).send(body);}
 // Shared by every Google sign-in endpoint. Generous because many mobile users
 // share one IP behind carrier NAT; the Google ID-token check bounds abuse.
 const loginRateLimit={max:60,timeWindow:'1 hour'};
@@ -30,11 +34,18 @@ function featureDisplay(f){
  const n=f.limit;
  if(f.key==='exports')return n===null?'Unlimited exports':`${n} exports / month`;
  if(f.key==='max_shorts')return n===null?'Unlimited shorts per project':`Up to ${n} shorts per project`;
+ if(f.key==='storage_bytes')return n===null?'Unlimited cloud storage':`${formatBytes(n)} cloud storage`;
  if(f.key==='max_duration'){
  if(n===null)return 'No export length limit';
  return n>=120&&n%60===0?`Up to ${n/60} min per export`:`Up to ${n} sec per export`;
  }
  return n===null?`${f.label}: unlimited`:`${f.label}: ${n}`;
+}
+// Binary units labelled MB/GB, matching the frontend's formatBytes.
+function formatBytes(n){
+ const gb=n/1024**3;
+ if(gb>=1)return `${Number(gb.toFixed(1))} GB`;
+ return `${Number((n/1024**2).toFixed(1))} MB`;
 }
 // featureRows must already be ordered by features.sort_order.
 function serializePlans(plans,featureRows){
@@ -47,10 +58,19 @@ function serializePlans(plans,featureRows){
  }),
  }));
 }
-export {featureDisplay,serializePlans};
-const serializeUser=(u,plan,features)=>({id:u.id,email:u.email,name:u.name,avatarUrl:u.avatar_url,isAdmin:u.is_admin,plan,features});
-const serializeProject=p=>({id:p.id,title:p.title,status:p.status,clipCount:p.clip_count,duration:Number(p.duration),thumbnail:p.thumbnail,sessionId:p.session_id,jobId:p.job_id,createdAt:p.created_at,updatedAt:p.updated_at});
-const serializeProjectDetail=p=>({...serializeProject(p),edit:p.edit||{clips:[],captions:[]}});
+export {featureDisplay,serializePlans,formatBytes};
+const serializeUser=(u,plan,features,storage)=>({id:u.id,email:u.email,name:u.name,avatarUrl:u.avatar_url,isAdmin:u.is_admin,plan,features,storage:{used:storage.used,limit:storage.limit},settings:{communitySharing:u.community_sharing},overQuotaSince:u.over_quota_since});
+const serializeProject=(p,bytes=0)=>({id:p.id,title:p.title,status:p.status,clipCount:p.clip_count,duration:Number(p.duration),thumbnail:p.thumbnail,sessionId:p.session_id,jobId:p.job_id,bytes,createdAt:p.created_at,updatedAt:p.updated_at});
+const serializeProjectDetail=(p,bytes)=>({...serializeProject(p,bytes),edit:p.edit||{clips:[],captions:[]}});
+async function withBytes(c,p){return serializeProject(p,(await projectBytes(c,[p.id])).get(p.id));}
+// The full /v1/me body; every endpoint that returns a user uses this.
+async function userBody(c,userId){
+ const {rows:[user]}=await c.query('select * from shorts.users where id=$1',[userId]);
+ const {rows:[plan]}=await c.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where id=$1',[user.plan_id]);
+ const features=await getCustomerFeatures(c,userId);
+ return serializeUser(user,plan,features,await usage(c,userId));
+}
+export {userBody};
 async function getCustomerFeatures(c,userId){
  const {rows:catalog}=await c.query('select key,value_type from shorts.features');
  const {rows:planRows}=await c.query('select pf.feature_key,pf.enabled,pf.config from shorts.plan_features pf join shorts.users u on u.plan_id=pf.plan_id where u.id=$1',[userId]);
@@ -88,7 +108,7 @@ async function getCustomerFeatures(c,userId){
  }
  return features;
 }
-export {getCustomerFeatures};
+export {getCustomerFeatures,userAuth};
 // Auth boundary for real accounts; distinct from the anonymous editor session's 404/410 convention.
 async function userAuth(c,req){
  const token=req.headers.authorization?.replace(/^Bearer /,'')||'';
@@ -100,6 +120,15 @@ async function userAuth(c,req){
  if(!row)throw fail(401,'Invalid or expired token');
  return row;
 }
+// After any plan change (admin today, the payments webhook later): restart or
+// stop the over-quota grace clock, and put users whose new plan can't opt out
+// back into the community showcase for future exports.
+async function applyPlanChange(c,userId){
+ await syncOverQuota(c,userId);
+ const features=await getCustomerFeatures(c,userId);
+ if(!features.community_opt_out?.enabled)await c.query('update shorts.users set community_sharing=true where id=$1',[userId]);
+}
+export {applyPlanChange};
 async function verifyGoogleIdToken(idToken){
  if(!process.env.GOOGLE_CLIENT_ID)throw fail(503,'Google sign-in is not configured on the server');
  const verify=await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`).catch(()=>null);
@@ -123,10 +152,7 @@ async function upsertGoogleUser(c,payload){
 async function issueSession(c,userId){
  const token=randomBytes(32).toString('hex');
  await c.query('insert into shorts.user_tokens(id,user_id,token_hash) values($1,$2,$3)',[randomUUID(),userId,hash(token)]);
- const {rows:[user]}=await c.query('select * from shorts.users where id=$1',[userId]);
- const {rows:[plan]}=await c.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where id=$1',[user.plan_id]);
- const features=await getCustomerFeatures(c,user.id);
- return {token,user:serializeUser(user,plan,features)};
+ return {token,user:await userBody(c,userId)};
 }
 export default async function users(app){
  app.post('/v1/auth/google',{config:{rateLimit:loginRateLimit}},async(req,reply)=>{
@@ -134,7 +160,7 @@ export default async function users(app){
  const payload=await verifyGoogleIdToken(idToken);
  return transaction(async c=>{
  const userId=await upsertGoogleUser(c,payload);
- return reply.code(201).send(await issueSession(c,userId));
+ reply.code(201);return await issueSession(c,userId);
  });
  });
  // www.shortmonk.com sign-in: returns a one-time code instead of a token; the
@@ -146,7 +172,7 @@ export default async function users(app){
  const userId=await upsertGoogleUser(c,payload);
  const code=randomBytes(32).toString('base64url');
  const {rows:[row]}=await c.query('insert into shorts.auth_handoff_codes(code_hash,user_id) values($1,$2) returning expires_at',[hash(code),userId]);
- return reply.code(201).send({code,expiresAt:row.expires_at});
+ reply.code(201);return {code,expiresAt:row.expires_at};
  });
  });
  app.post('/v1/auth/exchange',{config:{rateLimit:{max:60,timeWindow:'1 hour'}}},async(req,reply)=>{
@@ -157,24 +183,35 @@ export default async function users(app){
  // DELETE ... RETURNING is what makes a code single-use; keep it one statement.
  const {rows:[row]}=await c.query('delete from shorts.auth_handoff_codes where code_hash=$1 and expires_at>now() returning user_id',[hash(code)]);
  if(!row)throw fail(401,'This sign-in link has expired. Please sign in again.');
- return reply.code(201).send(await issueSession(c,row.user_id));
+ reply.code(201);return await issueSession(c,row.user_id);
  });
  });
  app.get('/v1/me',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
- const {rows:[plan]}=await c.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where id=$1',[user.plan_id]);
+ return userBody(c,user.id);
+ }));
+ app.patch('/v1/me/settings',async req=>transaction(async c=>{
+ const user=await userAuth(c,req);
+ const {communitySharing}=settingsBody.parse(req.body||{});
+ if(!communitySharing){
  const features=await getCustomerFeatures(c,user.id);
- return serializeUser(user,plan,features);
+ if(!features.community_opt_out?.enabled)throw Object.assign(fail(403,'Upgrade to keep your shorts out of the community showcase.'),{feature_key:'community_opt_out'});
+ // Opting out is retroactive; opting back in only affects future exports.
+ await c.query("update shorts.assets set community_shareable=false where user_id=$1 and kind='export' and community_shareable",[user.id]);
+ }
+ await c.query('update shorts.users set community_sharing=$2 where id=$1',[user.id,communitySharing]);
+ return userBody(c,user.id);
  }));
  app.post('/v1/logout',async(req,reply)=>{
  const token=req.headers.authorization?.replace(/^Bearer /,'')||'';
  await pool.query('delete from shorts.user_tokens where token_hash=$1',[hash(token)]);
- return reply.code(204).send();
+ reply.code(204);return null;
  });
  app.get('/v1/projects',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
- const {rows}=await c.query('select * from shorts.projects where user_id=$1 order by updated_at desc',[user.id]);
- return rows.map(serializeProject);
+ const {rows}=await c.query("select * from shorts.projects where user_id=$1 and holder='user' order by updated_at desc",[user.id]);
+ const bytes=await projectBytes(c,rows.map(p=>p.id));
+ return rows.map(p=>serializeProject(p,bytes.get(p.id)));
  }));
  app.post('/v1/projects',async(req,reply)=>transaction(async c=>{
  const user=await userAuth(c,req);
@@ -182,20 +219,20 @@ export default async function users(app){
  const id=randomUUID();
  await c.query('insert into shorts.projects(id,user_id,title) values($1,$2,$3)',[id,user.id,title||'Untitled short']);
  const {rows:[project]}=await c.query('select * from shorts.projects where id=$1',[id]);
- return reply.code(201).send(serializeProject(project));
+ reply.code(201);return serializeProject(project);
  }));
  app.get('/v1/projects/:id',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
  const id=uuid.parse(req.params.id);
- const {rows:[project]}=await c.query('select * from shorts.projects where id=$1 and user_id=$2',[id,user.id]);
+ const {rows:[project]}=await c.query("select * from shorts.projects where id=$1 and user_id=$2 and holder='user'",[id,user.id]);
  if(!project)throw fail(404,'Project not found');
- return serializeProjectDetail(project);
+ return serializeProjectDetail(project,(await projectBytes(c,[id])).get(id));
  }));
  app.patch('/v1/projects/:id',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
  const id=uuid.parse(req.params.id);
  const patch=patchBody.parse(req.body||{});
- const {rows:[existing]}=await c.query('select id from shorts.projects where id=$1 and user_id=$2',[id,user.id]);
+ const {rows:[existing]}=await c.query("select id from shorts.projects where id=$1 and user_id=$2 and holder='user'",[id,user.id]);
  if(!existing)throw fail(404,'Project not found');
  if(patch.edit){
  const features=await getCustomerFeatures(c,user.id);
@@ -221,13 +258,21 @@ export default async function users(app){
  }
  await c.query(`update shorts.projects set ${sets.join(',')} where id=$1`,values);
  const {rows:[project]}=await c.query('select * from shorts.projects where id=$1',[id]);
- return serializeProject(project);
+ return withBytes(c,project);
  }));
  app.delete('/v1/projects/:id',async(req,reply)=>transaction(async c=>{
  const user=await userAuth(c,req);
  const id=uuid.parse(req.params.id);
- await c.query('delete from shorts.projects where id=$1 and user_id=$2',[id,user.id]);
- return reply.code(204).send();
+ const {rows:[project]}=await c.query("select id from shorts.projects where id=$1 and user_id=$2 and holder='user' for update",[id,user.id]);
+ if(project){
+ // The worker purges the objects; the rows keep object_key after
+ // project_id is nulled by the delete below.
+ const {rows:assets}=await c.query("select * from shorts.assets where project_id=$1 and holder='user' and status=any($2) for update",[id,COUNTED]);
+ for(const a of assets)await markDeleting(c,a);
+ await c.query('delete from shorts.projects where id=$1',[id]);
+ await syncOverQuota(c,user.id,{set:false});
+ }
+ reply.code(204);return null;
  }));
  app.post('/v1/projects/:id/sync',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
@@ -249,10 +294,7 @@ export default async function users(app){
  }
  await c.query('update shorts.projects set status=$2,session_id=$3,job_id=$4,build_charged=$5,updated_at=now() where id=$1',[id,status,sessionId,jobId,charged]);
  const {rows:[updatedProject]}=await c.query('select * from shorts.projects where id=$1',[id]);
- const {rows:[updatedUser]}=await c.query('select * from shorts.users where id=$1',[user.id]);
- const {rows:[plan]}=await c.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where id=$1',[updatedUser.plan_id]);
- const updatedFeatures=await getCustomerFeatures(c,user.id);
- return {project:serializeProject(updatedProject),user:serializeUser(updatedUser,plan,updatedFeatures)};
+ return {project:await withBytes(c,updatedProject),user:await userBody(c,user.id)};
  }));
  async function adminAuth(c,req){
  const user=await userAuth(c,req);
@@ -276,9 +318,49 @@ export default async function users(app){
  await c.query('update shorts.customer_subscriptions set ended_at=now(),status=\'ended\' where user_id=$1 and ended_at is null',[customerId]);
  await c.query('insert into shorts.customer_subscriptions(id,user_id,plan_id) values($1,$2,$3)',[randomUUID(),customerId,planId]);
  await c.query('update shorts.users set plan_id=$2 where id=$1',[customerId,planId]);
- const {rows:[updatedUser]}=await c.query('select * from shorts.users where id=$1',[customerId]);
- const {rows:[updatedPlan]}=await c.query('select id,slug,name,price_inr as "priceInr",billing_interval as "billingInterval" from shorts.plans where id=$1',[planId]);
- const features=await getCustomerFeatures(c,customerId);
- return serializeUser(updatedUser,updatedPlan,features);
+ await applyPlanChange(c,customerId);
+ return userBody(c,customerId);
+ }));
+ app.get('/v1/admin/storage',async req=>transaction(async c=>{
+ await adminAuth(c,req);
+ const {rows:[t]}=await c.query(`select
+ coalesce(sum(bytes) filter(where holder='user' and status in ('uploaded','ready')),0)::bigint as user_bytes,
+ count(*) filter(where holder='user' and status in ('uploaded','ready')) as user_assets,
+ coalesce(sum(bytes) filter(where holder='internal' and status=any($1)),0)::bigint as internal_bytes,
+ count(*) filter(where holder='internal' and status=any($1)) as internal_assets,
+ coalesce(sum(bytes) filter(where status='pending'),0)::bigint as pending_bytes,
+ coalesce(sum(bytes) filter(where kind='source' and holder='user' and status=any($1)),0)::bigint as source_bytes,
+ coalesce(sum(bytes) filter(where kind='export' and holder='user' and status=any($1)),0)::bigint as export_bytes
+ from shorts.assets`,[COUNTED]);
+ const {rows:byPlan}=await c.query(`select p.slug,count(distinct u.id)::int as users,coalesce(sum(a.bytes) filter(where a.holder='user' and a.status=any($1)),0)::bigint as bytes
+ from shorts.plans p left join shorts.users u on u.plan_id=p.id left join shorts.assets a on a.user_id=u.id group by p.slug,p.sort_order order by p.sort_order`,[COUNTED]);
+ const {rows:top}=await c.query(`select u.id,u.email,sum(a.bytes)::bigint as bytes from shorts.assets a join shorts.users u on u.id=a.user_id
+ where a.holder='user' and a.status=any($1) group by u.id,u.email order by bytes desc limit 20`,[COUNTED]);
+ const topUsers=[];
+ for(const r of top)topUsers.push({userId:r.id,email:r.email,bytes:Number(r.bytes),limit:(await usage(c,r.id)).limit});
+ return {
+ userHeld:{bytes:Number(t.user_bytes),assets:Number(t.user_assets)},
+ internal:{bytes:Number(t.internal_bytes),assets:Number(t.internal_assets)},
+ pending:{bytes:Number(t.pending_bytes)},
+ byPlan:byPlan.map(r=>({slug:r.slug,users:r.users,bytes:Number(r.bytes)})),
+ byKind:{source:Number(t.source_bytes),export:Number(t.export_bytes)},
+ topUsers,
+ };
+ }));
+ app.get('/v1/admin/customers/:id/storage',async req=>transaction(async c=>{
+ await adminAuth(c,req);
+ const customerId=uuid.parse(req.params.id);
+ const {rows:[customer]}=await c.query('select id,over_quota_since from shorts.users where id=$1',[customerId]);
+ if(!customer)throw fail(404,'Customer not found');
+ const {rows}=await c.query(`select p.id,p.title,p.holder,p.retained_at,
+ coalesce(sum(a.bytes) filter(where a.status=any($2)),0)::bigint as bytes,
+ count(a.id) filter(where a.kind='source' and a.status=any($2))::int as sources,
+ count(a.id) filter(where a.kind='export' and a.status=any($2))::int as exports
+ from shorts.projects p left join shorts.assets a on a.project_id=p.id
+ where p.user_id=$1 group by p.id order by p.updated_at desc`,[customerId,COUNTED]);
+ return {
+ userId:customerId,overQuotaSince:customer.over_quota_since,storage:await usage(c,customerId),
+ projects:rows.map(r=>({id:r.id,title:r.title,holder:r.holder,retainedAt:r.retained_at,bytes:Number(r.bytes),sources:r.sources,exports:r.exports})),
+ };
  }));
 }
