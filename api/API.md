@@ -234,3 +234,103 @@ an `export` job is observed `completed` for that project — decrements `builds_
 Returns 402 if the Free plan's builds are already exhausted. Call this right after submitting an
 export and again once polling observes `completed`/`failed`, so the project and builds-remaining
 count stay accurate.
+
+## Cloud storage — footage and exports (plan 013)
+
+Project footage and exports live in a private object-storage bucket (Backblaze B2 via its S3 API).
+**Video bytes never pass through this API**: the browser uploads parts straight to presigned
+URLs and downloads from presigned URLs. All sizes are bytes; limits are binary (1 MB = 1024² bytes,
+1 GB = 1024³). All endpoints below require `Authorization: Bearer USER_TOKEN` and only see the
+caller's own, user-held (`holder='user'`) projects and files; anything else is 404.
+
+### Upload flow
+
+```
+browser                               API                              bucket
+  │ POST /v1/projects/:id/assets ───────▶ quota check (user row lock)
+  │   {bytes, contentType}                reserve bytes, CreateMultipartUpload ─▶
+  │ ◀─ 201 {asset, uploadId, partSize, parts:[{partNumber,url}], expiresAt}
+  │ PUT part 1..N (≤3 in parallel) ─────────────────────────────────────────▶ (reads ETag header)
+  │ POST /v1/assets/:id/parts {partNumbers} ─▶ fresh URLs (only if they expired)
+  │ POST /v1/assets/:id/complete ────────▶ CompleteMultipartUpload, HEAD ─────▶
+  │   {parts:[{partNumber,etag}]}          verify size, queue a probe job
+  │ ◀─ 200 {asset:{status:"uploaded",…}}   (worker probe → "ready" with metadata)
+```
+
+- `POST /v1/projects/:id/assets`, `{"bytes":1..2147483648,"contentType":"video/…"}` → 201
+  `{"asset":{"id","status":"pending","bytes"},"uploadId","partSize":16777216,"parts":[{"partNumber","url"}],"expiresAt"}`.
+  The declared `bytes` are reserved against the quota immediately. 60/hour per IP.
+- Part URLs are valid for **15 minutes**, each for exactly one key + upload id + part number (a
+  leaked URL can't read, list, delete, or write anything else). `PUT` each `file.slice()` to its URL
+  and keep the response `ETag`. The bucket's CORS exposes `ETag`.
+- `POST /v1/assets/:id/parts`, `{"partNumbers":[…]}` → `{"parts":[…],"expiresAt"}` — fresh URLs
+  while the asset is `pending`. 120/hour per user. 409 once the upload is finished.
+- `POST /v1/assets/:id/complete`, `{"parts":[{"partNumber","etag"}]}` with **every** part 1..N →
+  `{"asset":{…}}`, status `uploaded` (usable in jobs at once). If the stored object is bigger than
+  declared: 413, the object is deleted and the reservation released; smaller: `bytes` shrinks to the
+  real size. Calling it again after success returns the asset.
+- A worker `probe` job then fills `duration`/`width`/`height`/`hasAudio` and sets `ready`; a file
+  ffprobe rejects is deleted and its asset becomes `failed` (bytes released).
+
+An asset: `{"id","kind":"source|export","status","bytes","contentType","duration","width","height","hasAudio","createdAt"}`.
+Statuses: `pending` → `uploaded` → `ready`; `failed`; `deleting` → `deleted` (worker purge).
+
+### Other file endpoints
+
+- `GET /v1/projects/:id/assets` → the project's source assets (`pending|uploaded|ready`).
+- `GET /v1/assets/:id/url?disposition=inline|attachment` → `{"url","expiresAt"}`, a presigned
+  `GET` valid for **1 hour** (range requests work, so `<video>` can seek). Exports download as
+  `<project title>.mp4` (title stripped to letters, digits, spaces, `_`, `-`; fallback `my-short`).
+  Only `uploaded|ready` files.
+- `DELETE /v1/assets/:id` → 204. Frees quota immediately; the worker deletes every stored version
+  within minutes. 409 while a queued/running export or transcription of the project uses the file.
+- `GET /v1/projects/:id/exports` → `[{"id","jobId","bytes","duration","createdAt"}]`, newest first.
+- `DELETE /v1/projects/:id` also releases all of the project's files (same as deleting each).
+
+### Project jobs (replace the session job flow)
+
+- `POST /v1/projects/:id/jobs`, `{"kind":"export|transcribe","edit":{…}}` → 202 `{"id","status":"queued"}`.
+  `edit` is the job schema above; every `clips[].assetId` must be an `uploaded|ready` source asset of
+  this project (else 400). Plan checks: `auto_caption` (transcribe), `max_shorts`, `max_duration`,
+  `exports` (used < limit), and for exports `storage_bytes` (not over quota and not full). At most one
+  export/transcription per user at a time and 20 globally (429).
+- `GET /v1/projects/:id/jobs/:job` → `{"id","kind","status","progress","result","error","created_at","finished_at"}`.
+  A completed export has `result: {"assetId"}` — download it with `/v1/assets/:assetId/url`. A
+  completed transcription has `result: {"captions":[…]}`.
+- The export is charged (`exports` +1) when the worker finishes it; no `/sync` call is needed.
+
+### Quota
+
+`storage_bytes` is a `limit` feature (Free 500 MB, Starter 1 GB, Pro 2 GB; set in `plan_features`).
+Counted: user-held sources and exports in `pending|uploaded|ready`, including in-flight upload
+reservations. Duplicates count twice. `GET /v1/me` (and every response carrying a user) includes:
+
+```json
+{"storage":{"used":327155712,"limit":524288000},"settings":{"communitySharing":true},"overQuotaSince":null}
+```
+
+Refusals are `403 {"error":"Not enough storage: this clip needs 12 MB, you have 3.4 MB left.","featureKey":"storage_bytes"}`.
+Projects in `GET /v1/projects` and `GET /v1/projects/:id` carry `bytes` (their counted size).
+
+**Over quota** (usually after a downgrade; also when one export tips a user over): `overQuotaSince`
+is set, and uploads and exports are refused. It clears as soon as usage fits again (delete files or
+upgrade). After **14 days** still over, the worker moves the user's oldest idle projects — sources
+and exports together — to internal retention (`holder='internal'`) until usage fits: they disappear
+from the user's lists and quota but are kept in the bucket.
+
+### Community showcase setting
+
+`PATCH /v1/me/settings`, `{"communitySharing":boolean}` → the user. Turning it off requires the
+`community_opt_out` feature (403 `featureKey: "community_opt_out"` otherwise) and is retroactive: all
+existing exports become non-shareable. Turning it on affects future exports only. Moving to a plan
+without `community_opt_out` turns it back on for future exports.
+
+Showcase eligibility (for the future gallery):
+`kind='export' and status='ready' and community_shareable and holder='user'`.
+
+### Admin
+
+- `GET /v1/admin/storage` → `{"userHeld":{"bytes","assets"},"internal":{"bytes","assets"},"pending":{"bytes"},"byPlan":[{"slug","users","bytes"}],"byKind":{"source","export"},"topUsers":[{"userId","email","bytes","limit"}]}`.
+- `GET /v1/admin/customers/:id/storage` → `{"userId","overQuotaSince","storage","projects":[{"id","title","holder","retainedAt","bytes","sources","exports"}]}`,
+  including internal projects.
+- `PATCH /v1/admin/customers/:id/plan` also starts/stops the over-quota clock.
