@@ -59,7 +59,7 @@ export default async function assets(app,{storage}){
  const {partNumbers}=partsBody.parse(req.body||{});
  const n=partCount(Number(a.declared_bytes));
  if(partNumbers.some(p=>p>n))throw fail(400,`This upload has ${n} parts`);
- return {parts:await presignAll(storage,a,[...new Set(partNumbers)]),expiresAt:new Date(Date.now()+PART_TTL*1000).toISOString()};
+ return {parts:await presignAll(storage,a,[...new Set(partNumbers)]),partSize:PART_SIZE,expiresAt:new Date(Date.now()+PART_TTL*1000).toISOString()};
  }));
  app.post('/v1/assets/:id/complete',async req=>{
  const {parts}=completeBody.parse(req.body||{});
@@ -128,7 +128,8 @@ export default async function assets(app,{storage}){
  app.get('/v1/projects/:id/assets',async req=>transaction(async c=>{
  const user=await userAuth(c,req);
  const p=await ownProject(c,user,req.params.id);
- const {rows}=await c.query("select * from shorts.assets where project_id=$1 and kind='source' and holder='user' and status=any($2) order by created_at",[p.id,COUNTED]);
+ // failed included so a client can tell a rejected file from footage it never uploaded.
+ const {rows}=await c.query("select * from shorts.assets where project_id=$1 and kind='source' and holder='user' and status in ('pending','uploaded','ready','failed') order by created_at",[p.id]);
  return rows.map(serializeAsset);
  }));
  app.get('/v1/projects/:id/exports',async req=>transaction(async c=>{

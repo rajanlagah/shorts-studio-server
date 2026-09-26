@@ -263,7 +263,7 @@ browser                               API                              bucket
 - Part URLs are valid for **15 minutes**, each for exactly one key + upload id + part number (a
   leaked URL can't read, list, delete, or write anything else). `PUT` each `file.slice()` to its URL
   and keep the response `ETag`. The bucket's CORS exposes `ETag`.
-- `POST /v1/assets/:id/parts`, `{"partNumbers":[…]}` → `{"parts":[…],"expiresAt"}` — fresh URLs
+- `POST /v1/assets/:id/parts`, `{"partNumbers":[…]}` → `{"parts":[…],"partSize","expiresAt"}` — fresh URLs
   while the asset is `pending`. 120/hour per user. 409 once the upload is finished.
 - `POST /v1/assets/:id/complete`, `{"parts":[{"partNumber","etag"}]}` with **every** part 1..N →
   `{"asset":{…}}`, status `uploaded` (usable in jobs at once). If the stored object is bigger than
@@ -277,7 +277,7 @@ Statuses: `pending` → `uploaded` → `ready`; `failed`; `deleting` → `delete
 
 ### Other file endpoints
 
-- `GET /v1/projects/:id/assets` → the project's source assets (`pending|uploaded|ready`).
+- `GET /v1/projects/:id/assets` → the project's source assets (`pending|uploaded|ready|failed`).
 - `GET /v1/assets/:id/url?disposition=inline|attachment` → `{"url","expiresAt"}`, a presigned
   `GET` valid for **1 hour** (range requests work, so `<video>` can seek). Exports download as
   `<project title>.mp4` (title stripped to letters, digits, spaces, `_`, `-`; fallback `my-short`).
