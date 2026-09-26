@@ -1,7 +1,9 @@
 -- Durable footage/exports in object storage (Backblaze B2 via the S3 API) +
 -- per-user storage quotas. See plans/013-backend-object-storage-and-quotas.md
--- (frontend repo). Additive only: safe to apply before the code ships. The
--- Free sync_to_cloud flip is 0007, applied at deploy time.
+-- (frontend repo). Invisible to the pre-013 code, so safe to apply before it
+-- ships: the catalog rows below have no plan_features yet, so /v1/plans is
+-- unchanged. Plan limits and the Free sync_to_cloud flip are 0007, applied
+-- at deploy time.
 
 create table if not exists shorts.assets (
  id uuid primary key,
@@ -63,16 +65,6 @@ insert into shorts.features (key,label,value_type,sort_order) values
  ('storage_bytes','Cloud storage','limit',5),
  ('community_opt_out','Keep shorts out of the community showcase','boolean',6)
 on conflict (key) do nothing;
-insert into shorts.plan_features (plan_id,feature_key,enabled,config)
-select p.id,f.key,f.enabled,f.config::jsonb from shorts.plans p join (values
- ('free','storage_bytes',true,'{"limit":524288000}'),
- ('starter','storage_bytes',true,'{"limit":1073741824}'),
- ('pro','storage_bytes',true,'{"limit":2147483648}'),
- ('free','community_opt_out',false,'{}'),
- ('starter','community_opt_out',true,'{}'),
- ('pro','community_opt_out',true,'{}')
-) as f(slug,key,enabled,config) on f.slug=p.slug
-on conflict (plan_id,feature_key) do nothing;
 
 alter table shorts.assets enable row level security;
 alter table shorts.storage_events enable row level security;
