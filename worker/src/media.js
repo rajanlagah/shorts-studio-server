@@ -2,7 +2,7 @@ import {spawn} from 'node:child_process';
 import {writeFile,readFile,mkdir} from 'node:fs/promises';
 import {join} from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {assetPath,edit} from './common.js';
+import {edit} from './common.js';
 import {FONTS,resolveStyle} from './style.js';
 const fontsDir=fileURLToPath(new URL('../fonts/ttf',import.meta.url));
 export function run(bin,args,{cwd,signal}={}){return new Promise((resolve,reject)=>{
@@ -15,7 +15,7 @@ export async function probe(path,signal){
  const result=JSON.parse(await run('ffprobe',['-v','error','-protocol_whitelist','file,pipe','-format_whitelist','mov,matroska,webm','-show_streams','-show_format','-of','json',path],{signal}));
  const v=result.streams.find(x=>x.codec_type==='video');const duration=Number(result.format.duration);
  if(!v || !Number.isFinite(duration) || duration<=0 || duration>3600 || v.width>4096 || v.height>4096)throw new Error('Unsupported video: maximum 4096 pixels per side and 1 hour source duration');
- return {duration,audio:result.streams.some(x=>x.codec_type==='audio')};
+ return {duration,width:v.width,height:v.height,audio:result.streams.some(x=>x.codec_type==='audio')};
 }
 const stamp=t=>{const n=Math.round(t*100);return `${Math.floor(n/360000)}:${String(Math.floor(n/6000)%60).padStart(2,'0')}:${String(Math.floor(n/100)%60).padStart(2,'0')}.${String(n%100).padStart(2,'0')}`;};
 // ASS colors are &HBBGGRR&; alpha is &HAA& with 00 = opaque.
@@ -91,10 +91,12 @@ Style: Box,Noto Sans,58,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,1,0,0,0,100,
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 `+captions.flatMap(c=>captionEvents(c,resolveStyle(captionStyle,c.style))).join('\n');
 }
-export async function renderTimeline(sessionId,input,work,{signal,onProgress=async()=>{}}={}){
+// `resolve(assetId)` returns (or produces) the local file of a source clip:
+// a session upload for legacy jobs, the object-storage cache for project jobs.
+export async function renderTimeline(resolve,input,work,{signal,onProgress=async()=>{}}={}){
  const payload=edit.parse(input);await mkdir(work,{recursive:true});
  for(let i=0;i<payload.clips.length;i++){
- const c=payload.clips[i],path=assetPath(sessionId,c.assetId),meta=await probe(path,signal),duration=c.end-c.start;
+ const c=payload.clips[i],path=await resolve(c.assetId),meta=await probe(path,signal),duration=c.end-c.start;
  if(c.end>meta.duration+0.05)throw new Error('Trim exceeds source duration');
  const scale=c.fit==='crop'?'scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920':'scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black';
  const args=['-nostdin','-y','-v','error','-filter_threads','1','-threads','1','-protocol_whitelist','file,pipe','-format_whitelist','mov,matroska,webm','-ss',String(c.start),'-i',path];
@@ -106,18 +108,18 @@ export async function renderTimeline(sessionId,input,work,{signal,onProgress=asy
  await run('ffmpeg',['-nostdin','-y','-v','error','-f','concat','-safe','1','-i','clips.txt','-c','copy','-movflags','+faststart','joined.mp4'],{cwd:work,signal});
  return join(work,'joined.mp4');
 }
-export async function exportVideo(sessionId,input,work,options){
+export async function exportVideo(resolve,input,work,options){
  const payload=edit.parse(input);
- await renderTimeline(sessionId,payload,work,options);
+ await renderTimeline(resolve,payload,work,options);
  if(payload.captions.length){
  await writeFile(join(work,'captions.ass'),ass(payload.captions,payload.captionStyle));
  await run('ffmpeg',['-nostdin','-y','-v','error','-filter_threads','1','-i','joined.mp4','-vf',`ass=captions.ass:fontsdir='${fontsDir}'`,'-c:v','libx264','-preset','veryfast','-crf','23','-threads','1','-c:a','copy','-movflags','+faststart','output.mp4'],{cwd:work,signal:options.signal});
  }else{const {rename}=await import('node:fs/promises');await rename(join(work,'joined.mp4'),join(work,'output.mp4'));}
  return {downloadReady:true};
 }
-export async function transcribe(sessionId,payload,work,options){
+export async function transcribe(resolve,payload,work,options){
  if(!process.env.OPENAI_API_KEY)throw new Error('Auto-captions disabled: configure OPENAI_API_KEY on worker');
- await renderTimeline(sessionId,payload,work,options);
+ await renderTimeline(resolve,payload,work,options);
  await run('ffmpeg',['-nostdin','-y','-v','error','-i','joined.mp4','-vn','-ac','1','-ar','16000','audio.wav'],{cwd:work,signal:options.signal});
  const form=new FormData();form.append('file',new Blob([await readFile(join(work,'audio.wav'))],{type:'audio/wav'}),'audio.wav');form.append('model','whisper-1');form.append('response_format','verbose_json');form.append('timestamp_granularities[]','segment');
  form.append('timestamp_granularities[]','word');
