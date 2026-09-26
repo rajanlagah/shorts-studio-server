@@ -2,7 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync} from 'node:fs';
 const read=p=>readFileSync(new URL(p,import.meta.url),'utf8');
-test('worker and api style.js/common.js are byte-identical',()=>{
+test('worker and api style.js/common.js/storage.js/storage-usage.js are byte-identical',()=>{
  assert.equal(read('../src/style.js'),read('../../worker/src/style.js'));
  assert.equal(read('../src/common.js'),read('../../worker/src/common.js'));
+ assert.equal(read('../src/storage.js'),read('../../worker/src/storage.js'));
+ assert.equal(read('../src/storage-usage.js'),read('../../worker/src/storage-usage.js'));
 });
