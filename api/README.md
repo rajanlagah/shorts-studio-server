@@ -66,6 +66,18 @@ For automatic captions: submit a `transcribe` job with the current timeline, pol
 
 ## Lifecycle and limits
 
+Project footage and exports (the current app flow, plan 013) are durable in object storage — see
+"Object storage" below. The session limits in this section apply to the legacy
+`/v1/sessions/*` flow only, which is removed once plan 014's frontend has shipped.
+
+- Project files: 2 GiB per file, per-user total set by the `storage_bytes` plan feature (see API.md
+  "Cloud storage"). Exports are kept until the user deletes them. Sources no clip references for 24
+  hours, and uploads left unfinished for 24 hours, are cleaned up by the worker.
+- The worker keeps a local footage cache under `DATA_DIR/cache` (LRU, `CACHE_MAX_BYTES`, default
+  20 GiB) and renders in `DATA_DIR/work/<job>`, deleted after each job.
+
+Legacy sessions:
+
 - Up to 5 uploaded assets and 500 MiB combined per session.
 - Up to 5 timeline clips, 180 seconds final duration, 1080×1920 at 30 fps.
 - MP4/MOV and WebM/Matroska containers only; decoder support depends on FFmpeg. Media is validated by the worker, not by its filename.
@@ -86,7 +98,28 @@ docker compose --profile https up -d --build
 
 For first-time testing, building on the Droplet is fine. For ongoing deployments, build each Dockerfile in CI, push version-tagged images to your private registry, and replace the Compose `build:` entries with `image:` references. Then use `docker compose pull` followed by `docker compose --profile https up -d`. A ready-to-run CI workflow is not included because repository/registry names are not configured.
 
-Container replacement preserves named volumes. **Do not run `docker compose down -v` while sessions are active.** Video files are not backed up. A destroyed Droplet loses videos even if DB rows survive. This shared-local-disk implementation requires a single Droplet; scaling across hosts requires shared/object storage first.
+Container replacement preserves named volumes. **Do not run `docker compose down -v` while legacy sessions are active.** Legacy session uploads are not backed up; project footage and exports live in object storage and survive a destroyed Droplet (the local volume is only a cache). One worker is still required (advisory lock).
+
+## Object storage (Backblaze B2)
+
+One private bucket and one application key per environment (`shortmonk-media-dev`,
+`shortmonk-media`). Set the `S3_*` variables in both `api/.env` and `worker/.env`.
+
+1. Bucket: **private**. Lifecycle rules — both are load-bearing for cost:
+   - `daysFromHidingToDeleting: 1` for prefix `""` (B2 keeps and bills "deleted" versions otherwise;
+     the worker deletes every version, this is the backstop),
+   - unfinished large files (multipart uploads) cleaned up after 1 day.
+2. CORS (browser uploads/downloads go straight to the bucket): origins = the app origins from
+   `CORS_ORIGINS`; operations `s3_get`, `s3_head`, `s3_put`; allowed headers `*`; **expose `ETag`**;
+   max age 3600.
+3. Application key restricted to the bucket, with read/write/delete/list files (multipart is
+   included in write).
+4. `npm run storage:reconcile` (api) lists orphan objects, rows whose object is missing, and ledger
+   drift; `-- --fix` deletes the orphans. Run it weekly for now.
+
+Keys are `u/{userId}/p/{projectId}/a/{assetId}` (sources) and `…/x/{assetId}.mp4` (exports), and
+never change. To switch provider: copy objects (`rclone`), update `provider`/`bucket` on
+`shorts.assets`, change env.
 
 ## Testing and operating
 

@@ -9,14 +9,18 @@
   "scripts": {
     "db:migrate": "node --env-file-if-exists=.env.migrations scripts/migrate.js",
     "start": "node --env-file-if-exists=.env src/index.js",
-    "test": "node --test"
+    "test": "node --test",
+    "storage:reconcile": "node --env-file-if-exists=.env scripts/storage-reconcile.js"
   },
   "dependencies": {
-    "pg": "^8.16.3",
-    "zod": "^3.25.76",
-    "fastify": "^5.6.0",
+    "@aws-sdk/client-s3": "^3.1141.0",
+    "@aws-sdk/lib-storage": "^3.1141.0",
+    "@aws-sdk/s3-request-presigner": "^3.1141.0",
     "@fastify/cors": "^11.1.0",
     "@fastify/multipart": "^9.2.1",
-    "@fastify/rate-limit": "^10.3.0"
+    "@fastify/rate-limit": "^10.3.0",
+    "fastify": "^5.6.0",
+    "pg": "^8.16.3",
+    "zod": "^3.25.76"
   }
 }
